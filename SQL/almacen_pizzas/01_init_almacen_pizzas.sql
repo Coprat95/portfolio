@@ -303,6 +303,229 @@ BEGIN
 END;
 $$;
 
+--6.3) Creamos la Función de reposición (para cuando nos pide más picking del que tenemos)
+CREATE OR REPLACE FUNCTION fn_reposicion(p_prod_id INT)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_ubi_pick   INT;      -- ubicación de Picking para este producto
+  v_ubi_alt    INT;      -- ubicación de Stock altura para este producto
+  v_pick_qty   INT;      -- bultos en Picking
+  v_alt_qty    INT;      -- bultos en altura
+BEGIN
+  -- 1) Encuentra la ubicación de picking que ya existe en stock para este producto
+  SELECT s.ubicacion_id
+    INTO v_ubi_pick
+  FROM stock s
+  JOIN ubicaciones u ON u.id = s.ubicacion_id
+  WHERE s.producto_id = p_prod_id
+    AND u.tipo_zona = 'Picking'
+    AND u.altura    = 1
+  LIMIT 1;
+
+  IF v_ubi_pick IS NULL THEN
+    RAISE NOTICE 'fn_reposicion: no tengo fila de stock en Picking para producto %', p_prod_id;
+    RETURN;
+  END IF;
+
+  -- 2) Encuentra la ubicación de stock en altura (2–5) para este producto
+  SELECT s.ubicacion_id
+    INTO v_ubi_alt
+  FROM stock s
+  JOIN ubicaciones u ON u.id = s.ubicacion_id
+  WHERE s.producto_id = p_prod_id
+    AND u.tipo_zona = 'Stock'
+    AND u.altura BETWEEN 2 AND 5
+  LIMIT 1;
+
+  IF v_ubi_alt IS NULL THEN
+    RAISE NOTICE 'fn_reposicion: no tengo fila de stock en Altura para producto %', p_prod_id;
+    RETURN;
+  END IF;
+
+  -- 3) Lee las cantidades actuales (con COALESCE para evitar NULL)
+  SELECT COALESCE(bultos,0) INTO v_pick_qty
+    FROM stock
+   WHERE producto_id  = p_prod_id
+     AND ubicacion_id = v_ubi_pick;
+
+  SELECT COALESCE(bultos,0) INTO v_alt_qty
+    FROM stock
+   WHERE producto_id  = p_prod_id
+     AND ubicacion_id = v_ubi_alt;
+
+  RAISE NOTICE 'Reposición antes: prod % → picking ubi % = %, alt ubi % = %',
+               p_prod_id, v_ubi_pick, v_pick_qty, v_ubi_alt, v_alt_qty;
+
+  -- 4) Mover todo de alt a picking
+  UPDATE stock
+     SET bultos = v_pick_qty + v_alt_qty
+   WHERE producto_id  = p_prod_id
+     AND ubicacion_id = v_ubi_pick;
+
+  UPDATE stock
+     SET bultos = 0
+   WHERE producto_id  = p_prod_id
+     AND ubicacion_id = v_ubi_alt;
+
+  RAISE NOTICE 'Reposición después: prod % → picking ubi % = %',
+               p_prod_id, v_ubi_pick,
+               (v_pick_qty + v_alt_qty);
+
+END;
+$$;
+
+--6.4) Función trigger que revisa el stock en Picking y
+-- llama a reposicion si hace falta
+
+CREATE OR REPLACE FUNCTION trg_reponer_picking()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_pick_qty stock.bultos%TYPE;
+BEGIN
+    -- Obtener stock actual en Picking para este producto
+    SELECT COALESCE(bultos,0) INTO v_pick_qty
+    FROM stock s
+    JOIN ubicaciones u ON u.id = s.ubicacion_id
+    WHERE s.producto_id = NEW.producto_id  
+    AND u.tipo_zona = 'Picking'
+    AND u.estanteria = 'B2J'
+    AND u.altura  = 1;
+
+    RAISE NOTICE 'Trigger activado: producto %, bultos solicitados %, stock picking %', NEW.producto_id, NEW.bultos_solicitados, v_pick_qty;
+
+    IF NEW.bultos_solicitados > v_pick_qty THEN
+        RAISE NOTICE 'Reposición necesaria para producto %', NEW.producto_id;
+        PERFORM fn_reposicion(NEW.producto_id);
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+--6.5) 
+/* 3) Trigger que dispara la función antes de INSERT o UPDATE
+   en pedido_detalle. Es decir:
+
+   Cada vez que se cree o modifique una línea de pedido
+   (referencia de pizza) , el sistema
+   automáticamente revisa el stock disponible en Picking y genera una
+   reposición desde Altura si no hay suficiente cantidad.
+*/
+	
+DROP TRIGGER IF EXISTS trg_reponer_antes_pedido ON pedido_detalle;
+
+CREATE TRIGGER trg_reponer_antes_pedido
+BEFORE INSERT OR UPDATE ON pedido_detalle
+FOR EACH ROW
+WHEN (NEW.bultos_solicitados > 0 ) -- si de una referencia no pide bultos no se lanza el trigger
+EXECUTE FUNCTION trg_reponer_picking();
+
+-- 6.6) CREATE OR REPLACE PROCEDURE hacer_pedido()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_pedido_id    INT;             -- Identificador del nuevo pedido
+  v_prod         RECORD;          -- Cada fila de SELECT id FROM productos
+                                   -- Dentro del bucle podremos acceder a v_prod.id, v_prod.nombre, etc.
+  v_cant_req     INT;             -- Bultos solicitados aleatorios entre 0 y 100
+  v_stock_pick   INT;             -- Stock disponible en zona Picking
+  v_insuficiente BOOLEAN := FALSE; -- Flag que indica si faltó stock en alguno de los productos
+BEGIN
+
+  -- 1) Insertar cabecera con proveedor aleatorio y estado Pendiente
+  INSERT INTO pedidos(proveedor, estado)
+       VALUES (
+         CASE
+           WHEN random() < 0.5 THEN 'elapi'
+           ELSE 'italpi'
+         END,
+         'Pendiente'::tipo_estado_enum
+       )
+  RETURNING id INTO v_pedido_id;
+
+  -- 2) Recorrer todas las referencias de productos
+  FOR v_prod IN
+    SELECT id
+      FROM productos
+  LOOP
+
+    -- 2.1) Generar cantidad aleatoria entre 0 y 100
+    v_cant_req := floor(random() * 101)::INT;
+    IF v_cant_req = 0 THEN
+      CONTINUE;  -- Si sale 0, saltar al siguiente producto
+    END IF;
+
+    -- 2.2) Leer stock en Picking para el producto actual
+    SELECT COALESCE(s.bultos, 0)
+      INTO v_stock_pick
+      FROM stock s
+      JOIN ubicaciones u ON u.id = s.ubicacion_id
+     WHERE s.producto_id = v_prod.id
+       AND u.tipo_zona   = 'Picking'
+       AND u.estanteria  = 'B2J'
+       AND u.altura      = 1
+     LIMIT 1;
+
+    -- 2.3) Si no hay suficiente stock, reponer y recalcular
+    IF v_cant_req > v_stock_pick THEN
+      PERFORM fn_reposicion(v_prod.id);  -- Llamada a la función de reposición
+
+      SELECT COALESCE(s.bultos, 0)
+        INTO v_stock_pick
+        FROM stock s
+        JOIN ubicaciones u ON u.id = s.ubicacion_id
+       WHERE s.producto_id = v_prod.id
+         AND u.tipo_zona   = 'Picking'
+         AND u.estanteria  = 'B2J'
+         AND u.altura      = 1
+       LIMIT 1;
+    END IF;
+
+    -- 2.4) Si sigue faltando stock, marcar insuficiencia
+    IF v_cant_req > v_stock_pick THEN
+      v_insuficiente := TRUE;
+    END IF;
+
+    -- 2.5) Insertar línea de detalle del pedido
+    INSERT INTO pedido_detalle(pedido_id, producto_id, bultos_solicitados)
+      VALUES (v_pedido_id, v_prod.id, v_cant_req);
+
+  END LOOP;
+
+  -- 3) Finalizar o cancelar pedido según disponibilidad de stock
+  IF v_insuficiente THEN
+    -- 3.1) Marcar pedido como Cancelado
+    UPDATE pedidos
+       SET estado = 'Cancelado'::tipo_estado_enum
+     WHERE id = v_pedido_id;
+  ELSE
+    -- 3.2) Descontar del stock de Picking lo servido
+    UPDATE stock AS s
+      SET bultos = s.bultos - d.bultos_solicitados
+      FROM pedido_detalle AS d
+     WHERE d.pedido_id    = v_pedido_id
+       AND s.producto_id  = d.producto_id
+       AND s.ubicacion_id = (
+         SELECT id
+           FROM ubicaciones
+          WHERE tipo_zona  = 'Picking'
+            AND estanteria = 'B2J'
+            AND altura     = 1
+          LIMIT 1
+       );
+
+    -- 3.3) Marcar pedido como Acabado
+    UPDATE pedidos
+       SET estado = 'Acabado'::tipo_estado_enum
+     WHERE id = v_pedido_id;
+  END IF;
+
+END;
+$$;
+
 
 -- ======================================================
 -- 7) BLOQUE DE REINICIO / REINYECCIÓN DE STOCK
